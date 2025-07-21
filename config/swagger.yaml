@@ -1,0 +1,63 @@
+
+openapi: 3.0.3
+info:
+  title: Go Blockchain API
+  version: 1.0.0
+  description: Simple Blockchain API with authentication, block creation and retrieval
+
+servers:
+  - url: http://localhost:8080
+
+paths:
+  /blocks:
+    get:
+      summary: Get all blocks
+      responses:
+        '200':
+          description: OK
+    post:
+      summary: Add a new block
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: string
+      responses:
+        '201':
+          description: Created
+
+  /blocks/{id}:
+    get:
+      summary: Get block by index
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: integer
+          required: true
+          description: Numeric ID of the block
+      responses:
+        '200':
+          description: OK
+
+  /auth/login:
+    post:
+      summary: Authenticate and receive JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+      responses:
+        '200':
+          description: JWT token
