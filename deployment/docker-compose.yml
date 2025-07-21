@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: blockchain_postgres
+    environment:
+      POSTGRES_DB: blockchain
+      POSTGRES_USER: blockchain
+      POSTGRES_PASSWORD: blockchain123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - blockchain_network
+
+  blockchain:
+    build: .
+    container_name: blockchain_app
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=blockchain
+      - DB_USER=blockchain
+      - DB_PASSWORD=blockchain123
+      - JWT_SECRET=your-jwt-secret-key-change-in-production
+      - ENCRYPTION_KEY=your-32-byte-encryption-key-here
+      - P2P_PORT=9090
+    depends_on:
+      - postgres
+    networks:
+      - blockchain_network
+    volumes:
+      - ./logs:/app/logs
+
+  krakend:
+    image: devopsfaith/krakend:2.4
+    container_name: blockchain_gateway
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./krakend.json:/etc/krakend/krakend.json
+    depends_on:
+      - blockchain
+    networks:
+      - blockchain_network
+
+volumes:
+  postgres_data:
+
+networks:
+  blockchain_network:
+    driver: bridge
