@@ -1,16 +1,11 @@
+// main.go - Главная точка входа
 package main
 
 import (
-	"blockchain/internal/api"
-	"blockchain/internal/auth"
-	"blockchain/internal/blockchain"
-	"blockchain/internal/consensus"
-	"blockchain/internal/crypto"
-	"blockchain/internal/datastore"
-	"blockchain/internal/p2p"
-	"context"
-	"database/sql"
+	"crypto/tls"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,129 +13,143 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
+	"github.com/go-redis/redis/v8"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
+
+	"your-project/internal/api"
+	"your-project/internal/auth"
+	"your-project/internal/blockchain"
+	"your-project/internal/config"
+	"your-project/internal/datastore"
+	"your-project/internal/grpc_server"
+	"your-project/internal/middleware"
+	"your-project/internal/p2p"
+	pb "your-project/proto"
 )
 
-// @title Blockchain API
-// @version 1.0
-// @description A minimal and extendable blockchain service
-// @termsOfService http://swagger.io/terms/
-
-// @contact.name API Support
-// @contact.url http://www.swagger.io/support
-// @contact.email support@swagger.io
-
-// @license.name MIT
-// @license.url https://opensource.org/licenses/MIT
-
-// @host localhost:8080
-// @BasePath /api/v1
-
-// @securityDefinitions.apikey BearerAuth
-// @in header
-// @name Authorization
-
 func main() {
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using system environment variables")
-	}
+	// Загрузка конфигурации
+	cfg := config.Load()
 
-	// Database configuration
-	dbHost := getEnv("DB_HOST", "localhost")
-	dbPort := getEnv("DB_PORT", "5432")
-	dbName := getEnv("DB_NAME", "blockchain")
-	dbUser := getEnv("DB_USER", "blockchain")
-	dbPassword := getEnv("DB_PASSWORD", "blockchain123")
-
-	// Connect to database
-	db, err := sql.Open("postgres",
-		"host="+dbHost+" port="+dbPort+" user="+dbUser+" password="+dbPassword+" dbname="+dbName+" sslmode=disable")
+	// Инициализация базы данных
+	db, err := datastore.NewPostgreSQL(cfg.Database)
 	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
+		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer db.Close()
 
-	// Test database connection
-	if err := db.Ping(); err != nil {
-		log.Fatal("Failed to ping database:", err)
-	}
+	// Инициализация Redis для сессий
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.Redis.Addr,
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13,
+		},
+	})
 
-	// Initialize datastore
-	dataStore := datastore.New(db)
-	if err := dataStore.InitTables(); err != nil {
-		log.Fatal("Failed to initialize database tables:", err)
-	}
+	// Инициализация блокчейна
+	bc := blockchain.New(db, cfg.Blockchain)
 
-	// Initialize crypto service
-	encryptionKey := getEnv("ENCRYPTION_KEY", "your-32-byte-encryption-key-here")
-	cryptoService := crypto.New(encryptionKey)
+	// Инициализация аутентификации с повышенной безопасностью
+	authService := auth.NewSecureAuth(cfg.Auth, rdb)
 
-	// Initialize consensus engine
-	consensusEngine := consensus.NewPoW(4) // difficulty level 4
+	// Инициализация P2P сети с шифрованием
+	p2pNode := p2p.NewSecureNode(cfg.P2P, bc)
 
-	// Initialize blockchain
-	bc := blockchain.New(dataStore, cryptoService, consensusEngine)
-	if err := bc.Initialize(); err != nil {
-		log.Fatal("Failed to initialize blockchain:", err)
-	}
+	// Запуск gRPC сервера
+	go startGRPCServer(cfg, bc, authService)
 
-	// Initialize P2P network
-	p2pPort := getEnv("P2P_PORT", "9090")
-	p2pNetwork := p2p.New(p2pPort, bc)
-	go p2pNetwork.Start()
+	// Запуск REST API сервера
+	go startHTTPServer(cfg, bc, authService)
 
-	// Initialize auth service
-	jwtSecret := getEnv("JWT_SECRET", "your-jwt-secret-key-change-in-production")
-	authService := auth.New(jwtSecret, dataStore)
-
-	// Initialize API server
-	apiServer := api.New(bc, authService, p2pNetwork)
-
-	// Set Gin mode
-	if getEnv("GIN_MODE", "debug") == "release" {
-		gin.SetMode(gin.ReleaseMode)
-	}
-
-	// Setup router
-	router := apiServer.SetupRoutes()
-
-	// Create HTTP server
-	srv := &http.Server{
-		Addr:    ":" + getEnv("PORT", "8080"),
-		Handler: router,
-	}
-
-	// Start server in goroutine
-	go func() {
-		log.Println("Starting blockchain service on", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal("Failed to start server:", err)
-		}
-	}()
-
-	// Wait for interrupt signal to gracefully shutdown the server
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("Shutting down server...")
+	// Запуск P2P узла
+	go p2pNode.Start()
 
 	// Graceful shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
 
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatal("Server forced to shutdown:", err)
-	}
-
-	p2pNetwork.Stop()
-	log.Println("Server exited")
+	log.Println("Shutting down...")
+	p2pNode.Stop()
 }
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+func startGRPCServer(cfg *config.Config, bc *blockchain.Blockchain, auth *auth.SecureAuth) {
+	// Загрузка TLS сертификатов
+	creds, err := credentials.NewServerTLSFromFile(cfg.TLS.CertFile, cfg.TLS.KeyFile)
+	if err != nil {
+		log.Fatalf("Failed to load TLS credentials: %v", err)
 	}
-	return defaultValue
+
+	// Настройка gRPC сервера с keepalive
+	s := grpc.NewServer(
+		grpc.Creds(creds),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 15 * time.Second,
+			MaxConnectionAge:  30 * time.Second,
+			Time:              5 * time.Second,
+			Timeout:           1 * time.Second,
+		}),
+		grpc.UnaryInterceptor(middleware.GRPCAuthInterceptor(auth)),
+		grpc.StreamInterceptor(middleware.GRPCStreamAuthInterceptor(auth)),
+	)
+
+	// Регистрация сервисов
+	pb.RegisterBlockchainServiceServer(s, grpc_server.NewBlockchainServer(bc, auth))
+	pb.RegisterAuthServiceServer(s, grpc_server.NewAuthServer(auth))
+
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPC.Port))
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+
+	log.Printf("gRPC server listening on :%d", cfg.GRPC.Port)
+	if err := s.Serve(lis); err != nil {
+		log.Fatalf("Failed to serve gRPC: %v", err)
+	}
+}
+
+func startHTTPServer(cfg *config.Config, bc *blockchain.Blockchain, auth *auth.SecureAuth) {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+
+	// Безопасные middleware
+	r.Use(middleware.SecurityHeaders())
+	r.Use(middleware.RateLimit(cfg.RateLimit))
+	r.Use(middleware.CORS(cfg.CORS))
+	r.Use(gin.Logger())
+	r.Use(gin.Recovery())
+
+	// Инициализация API роутов
+	api.SetupRoutes(r, bc, auth)
+
+	// HTTPS сервер
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", cfg.HTTP.Port),
+		Handler: r,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			CurvePreferences: []tls.CurveID{
+				tls.CurveP521,
+				tls.CurveP384,
+				tls.CurveP256,
+			},
+			PreferServerCipherSuites: true,
+			CipherSuites: []uint16{
+				tls.TLS_AES_256_GCM_SHA384,
+				tls.TLS_CHACHA20_POLY1305_SHA256,
+				tls.TLS_AES_128_GCM_SHA256,
+			},
+		},
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1MB
+	}
+
+	log.Printf("HTTPS server listening on :%d", cfg.HTTP.Port)
+	log.Fatal(server.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile))
 }
